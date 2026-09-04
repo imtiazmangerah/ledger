@@ -15,6 +15,7 @@ import (
 	"github.com/formancehq/ledger/v3/internal/application/ctrl"
 	"github.com/formancehq/ledger/v3/internal/application/indexbuilder"
 	"github.com/formancehq/ledger/v3/internal/application/membership"
+	"github.com/formancehq/ledger/v3/internal/domain"
 	"github.com/formancehq/ledger/v3/internal/infra/backup"
 	"github.com/formancehq/ledger/v3/internal/infra/cache"
 	"github.com/formancehq/ledger/v3/internal/infra/monitoring/diskusage"
@@ -441,6 +442,19 @@ func (impl *ClusterServiceServerImpl) CreateCheckpoint(ctx context.Context, _ *c
 func (impl *ClusterServiceServerImpl) CreateQueryCheckpoint(ctx context.Context, _ *clusterpb.CreateQueryCheckpointRequest) (*clusterpb.CreateQueryCheckpointResponse, error) {
 	if _, err := internalauth.Authenticate(ctx, impl.authCfg, internalauth.ScopeClusterWrite); err != nil {
 		return nil, err
+	}
+
+	// A query checkpoint promises every projection used by checkpoint reads,
+	// including audit. Reject before proposing if this replica cannot
+	// materialize that promise; otherwise the Raft entry would succeed while
+	// the caller waits forever for a marker that must never be published.
+	if disabled, rebuilding := impl.readStore.AuditProjectionState(); disabled || rebuilding {
+		state := "disabled"
+		if rebuilding {
+			state = "rebuilding"
+		}
+
+		return nil, &domain.BusinessError{Err: &domain.ErrIndexBuilding{Index: "audit (" + state + ")"}}
 	}
 
 	// Route through Raft so the checkpoint is replicated to all nodes.

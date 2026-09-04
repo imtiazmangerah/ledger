@@ -11,6 +11,7 @@ import (
 
 	logging "github.com/formancehq/go-libs/v5/pkg/observe/log"
 
+	"github.com/formancehq/ledger/v3/internal/infra/state"
 	"github.com/formancehq/ledger/v3/internal/proto/auditpb"
 	"github.com/formancehq/ledger/v3/internal/proto/commonpb"
 	"github.com/formancehq/ledger/v3/internal/storage/dal"
@@ -30,6 +31,14 @@ func writeAuditEntry(t *testing.T, store *dal.Store, entry *auditpb.AuditEntry) 
 		kb.PutZonePrefix(dal.ZoneHistory, dal.SubHistoryAudit).PutUint64(entry.GetSequence()).Build(),
 		val,
 	))
+	require.NoError(t, batch.Commit())
+}
+
+func setAppliedIndex(t *testing.T, store *dal.Store, appliedIndex uint64) {
+	t.Helper()
+
+	batch := store.OpenWriteSession()
+	require.NoError(t, state.SetAppliedIndex(batch, appliedIndex))
 	require.NoError(t, batch.Commit())
 }
 
@@ -156,6 +165,68 @@ func TestIndexerCatchUpAndResume(t *testing.T) {
 	seqs, err = rs.AuditSeqsByString(readstore.AuditFieldLedger, "main")
 	require.NoError(t, err)
 	require.Equal(t, []uint64{1, 2}, seqs)
+}
+
+func TestProcessOncePublishesFixedRaftHorizonOnlyWithTerminalBatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	idx, mainStore, rs := newIndexerForTest(t)
+	idx.batchSize = 1
+
+	for sequence := uint64(1); sequence <= 3; sequence++ {
+		writeAuditEntry(t, mainStore, &auditpb.AuditEntry{
+			Sequence: sequence, ProposalId: sequence,
+			Timestamp: &commonpb.Timestamp{Data: sequence * 1_000_000},
+			Outcome:   &auditpb.AuditEntry_Success{Success: &auditpb.AuditSuccess{}},
+			Ledgers:   []string{"main"},
+		})
+	}
+	setAppliedIndex(t, mainStore, 11)
+
+	handle, err := mainStore.NewDirectReadHandle()
+	require.NoError(t, err)
+	defer func() { _ = handle.Close() }()
+
+	cursor, advanced, err := idx.processBatch(ctx, handle, 0, 3, 11)
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.Equal(t, uint64(1), cursor)
+	progress, err := rs.ReadAuditRaftProgress()
+	require.NoError(t, err)
+	require.Zero(t, progress, "an intermediate native batch must not certify the target")
+
+	cursor, advanced, err = idx.processBatch(ctx, handle, cursor, 3, 11)
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.Equal(t, uint64(2), cursor)
+	progress, err = rs.ReadAuditRaftProgress()
+	require.NoError(t, err)
+	require.Zero(t, progress, "a crash between batches must leave the Raft target unpublished")
+
+	cursor, advanced, err = idx.processBatch(ctx, handle, cursor, 3, 11)
+	require.NoError(t, err)
+	require.True(t, advanced)
+	require.Equal(t, uint64(3), cursor)
+	progress, err = rs.ReadAuditRaftProgress()
+	require.NoError(t, err)
+	require.Equal(t, uint64(11), progress, "the final index writes and certificate commit atomically")
+}
+
+func TestProcessOnceCertifiesAppliedEntryWithoutAuditMovement(t *testing.T) {
+	t.Parallel()
+
+	idx, mainStore, rs := newIndexerForTest(t)
+	setAppliedIndex(t, mainStore, 17)
+
+	cursor, err := idx.ProcessOnce(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, cursor)
+
+	progress, err := rs.ReadAuditRaftProgress()
+	require.NoError(t, err)
+	require.Equal(t, uint64(17), progress,
+		"a Raft entry that emits no audit item must still advance the causal certificate")
 }
 
 // TestProcessOnceWakesAuditWaiters verifies the indexer wakes readers blocked in

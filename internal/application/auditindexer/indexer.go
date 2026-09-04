@@ -71,6 +71,8 @@ func New(cfg Config, store *dal.Store, rs *readstore.Store, logger logging.Logge
 		batchSize = DefaultBatchSize
 	}
 
+	rs.SetAuditProjectionState(cfg.Disabled, false)
+
 	return &Indexer{
 		cfg:       cfg,
 		store:     store,
@@ -100,6 +102,21 @@ func (i *Indexer) ProcessOnce(ctx context.Context) (uint64, error) {
 		return 0, fmt.Errorf("reading audit progress: %w", err)
 	}
 
+	handle, err := i.store.NewDirectReadHandle()
+	if err != nil {
+		return cursor, fmt.Errorf("opening audit target snapshot: %w", err)
+	}
+	defer func() { _ = handle.Close() }()
+
+	targetAppliedIndex, err := query.ReadLastAppliedIndex(handle)
+	if err != nil {
+		return cursor, fmt.Errorf("reading audit target applied index: %w", err)
+	}
+	targetAuditSequence, err := query.ReadLastAuditSequence(handle)
+	if err != nil {
+		return cursor, fmt.Errorf("reading audit target sequence: %w", err)
+	}
+
 	for {
 		// Honor shutdown between batches: worker.Stop() blocks on this loop
 		// returning, so without this check draining a large backlog (or a
@@ -109,7 +126,7 @@ func (i *Indexer) ProcessOnce(ctx context.Context) (uint64, error) {
 			return cursor, err
 		}
 
-		next, advanced, err := i.processBatch(ctx, cursor)
+		next, advanced, err := i.processBatch(ctx, handle, cursor, targetAuditSequence, targetAppliedIndex)
 		if err != nil {
 			return cursor, err
 		}
@@ -121,6 +138,7 @@ func (i *Indexer) ProcessOnce(ctx context.Context) (uint64, error) {
 	}
 
 	i.lastIndexed.Store(cursor)
+	i.readStore.SetAuditProjectionState(false, false)
 
 	return cursor, nil
 }
@@ -128,6 +146,8 @@ func (i *Indexer) ProcessOnce(ctx context.Context) (uint64, error) {
 // Rebuild drops the audit index and the cursor, then replays from the earliest
 // surviving audit entry. Used by ledgerctl and by boot auto-rebuild.
 func (i *Indexer) Rebuild(ctx context.Context) error {
+	i.readStore.SetAuditProjectionState(false, true)
+	defer i.readStore.SetAuditProjectionState(false, false)
 	// Drop the index and reset the cursor in a single batch so the operation is
 	// crash-atomic: a torn write leaves either (old index, old cursor) or (empty
 	// index, cursor 0). The latter deterministically re-triggers boot rebuild
@@ -139,6 +159,9 @@ func (i *Indexer) Rebuild(ctx context.Context) error {
 		return err
 	}
 	if err := i.readStore.WriteAuditProgress(batch, 0); err != nil {
+		return err
+	}
+	if err := i.readStore.WriteAuditRaftProgress(batch, 0); err != nil {
 		return err
 	}
 	if err := batch.Commit(); err != nil {
@@ -169,13 +192,13 @@ func (i *Indexer) shouldRebuildOnBoot(cursor, last uint64) bool {
 // processBatch indexes up to batchSize audit entries whose sequence is strictly
 // greater than after, commits a single readstore batch, and returns the new
 // cursor and whether at least one entry was processed.
-func (i *Indexer) processBatch(ctx context.Context, after uint64) (uint64, bool, error) {
-	handle, err := i.store.NewDirectReadHandle()
-	if err != nil {
-		return after, false, fmt.Errorf("opening read handle: %w", err)
-	}
-	defer func() { _ = handle.Close() }()
-
+func (i *Indexer) processBatch(
+	ctx context.Context,
+	handle dal.PebbleReader,
+	after uint64,
+	targetAuditSequence uint64,
+	targetAppliedIndex uint64,
+) (uint64, bool, error) {
 	cur, err := query.ReadAuditEntries(ctx, handle, &after)
 	if err != nil {
 		return after, false, fmt.Errorf("reading audit entries after %d: %w", after, err)
@@ -218,11 +241,32 @@ func (i *Indexer) processBatch(ctx context.Context, after uint64) (uint64, bool,
 	}
 
 	if count == 0 {
+		if after >= targetAuditSequence {
+			progress, err := i.readStore.ReadAuditRaftProgress()
+			if err != nil {
+				return after, false, fmt.Errorf("reading audit Raft progress: %w", err)
+			}
+			if progress < targetAppliedIndex {
+				if err := i.readStore.WriteAuditRaftProgress(batch, targetAppliedIndex); err != nil {
+					return after, false, fmt.Errorf("writing audit Raft progress: %w", err)
+				}
+				if err := batch.Commit(); err != nil {
+					return after, false, fmt.Errorf("committing audit Raft progress: %w", err)
+				}
+				i.readStore.NotifyProgress()
+			}
+		}
+
 		return after, false, nil
 	}
 
 	if err := i.readStore.WriteAuditProgress(batch, cursor); err != nil {
 		return after, false, fmt.Errorf("writing audit progress %d: %w", cursor, err)
+	}
+	if cursor >= targetAuditSequence {
+		if err := i.readStore.WriteAuditRaftProgress(batch, targetAppliedIndex); err != nil {
+			return after, false, fmt.Errorf("writing audit Raft progress %d: %w", targetAppliedIndex, err)
+		}
 	}
 
 	if err := batch.Commit(); err != nil {
