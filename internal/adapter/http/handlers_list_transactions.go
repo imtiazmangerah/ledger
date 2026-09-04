@@ -27,7 +27,7 @@ import (
 // reverse=true returns oldest-first (ascending).
 //
 // Read-consistency options gap (tracked follow-up): the gRPC ListTransactions
-// honours ReadOptions.checkpointId / minLogSequence to pin a read to a
+// honours ReadOptions.checkpointId to pin a read to a
 // specific applied index; this HTTP route deliberately does NOT expose them
 // and serves a live, best-effort read of the current committed state. Clients
 // that need a consistency-bounded / checkpoint-pinned read must use gRPC. This

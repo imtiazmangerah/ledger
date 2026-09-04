@@ -8,7 +8,7 @@ import (
 // Ed25519 signing keys.
 //
 // Live, best-effort read: it drains the full cursor and does not expose the
-// gRPC read-consistency options (checkpointId / minLogSequence) or a
+// gRPC read-consistency option (checkpointId) or a
 // bidirectional cursor. Clients needing consistency-bounded reads use gRPC.
 // Tracked follow-up (same carve-out as ListTransactions / the audit reads).
 func (s *Server) handleListSigningKeys(w http.ResponseWriter, r *http.Request) {
