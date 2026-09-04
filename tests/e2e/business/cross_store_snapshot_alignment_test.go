@@ -15,6 +15,8 @@ import (
 	"github.com/formancehq/ledger/v3/tests/e2e/testutil"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Cross-store snapshot alignment (EN-1748): a transaction visible in the
@@ -116,43 +118,41 @@ var _ = Describe("Cross-store snapshot alignment", Ordered, func() {
 		defer stopPressure()
 
 		notTs := actions.NotFilter(actions.BuiltinUintRangeFilter(commonpb.TransactionBuiltinIndex_TX_BUILTIN_INDEX_TIMESTAMP, 0, ^uint64(0)))
-		deadline := time.Now().Add(25 * time.Second)
-		probes, served := 0, 0
-
-		for time.Now().Before(deadline) {
-			probes++
-
-			_, err := client.Apply(ctx, servicepb.UnsignedApplyRequest("", actions.CreateTransactionAction(ledgerName, []*commonpb.Posting{
-				actions.NewPosting("world", fmt.Sprintf("probe:%d", probes%64), big.NewInt(1), "USD"),
-			}, nil, nil)))
-			Expect(err).To(Succeed())
-
-			txs, err := actions.ListTransactionsFiltered(ctx, client, ledgerName, 0, 0, notTs)
-			if err != nil {
-				// A lagging fold legitimately rejects with the retryable
-				// not-caught-up precondition; only phantom ROWS are the bug.
-				continue
-			}
-			served++
-
-			if len(txs) > 0 {
-				Fail(fmt.Sprintf("probe %d: not(ts[_,_]) returned %d row(s), first id=%d — a committed tx surfaced as missing from the READY timestamp index", probes, len(txs), txs[0].GetId()))
-			}
-		}
-
-		Expect(served).To(BeNumerically(">", 0), "every probe was rejected — inconclusive")
-
-		// Drain the fold backlog before the spec ends: teardown stops the
-		// server under a bounded budget, which a deep backlog can exceed on
-		// slow runners.
-		stopPressure()
 		Eventually(func() uint64 {
 			st, err := actions.GetIndexStatus(ctx, client)
 			if err != nil {
-				return ^uint64(0)
+				return 0
 			}
 
 			return st.GetLag()
-		}, 3*time.Minute, 500*time.Millisecond).Should(BeZero(), "fold backlog drained")
+		}, 25*time.Second, 10*time.Millisecond).Should(BeNumerically(">=", 5_000), "pressure never made the fold lag — inconclusive")
+		stopPressure()
+
+		// The pre-EN-1946 path can reject with a retryable not-caught-up
+		// precondition. The first response it does serve must already be aligned;
+		// observing any rows from the index complement is the regression.
+		var (
+			queryErr  error
+			resultLen int
+			firstID   uint64
+		)
+		Eventually(func() bool {
+			txs, err := actions.ListTransactionsFiltered(ctx, client, ledgerName, 0, 0, notTs)
+			queryErr = err
+			if err != nil {
+				return status.Code(err) != codes.FailedPrecondition
+			}
+
+			resultLen = len(txs)
+			if resultLen > 0 {
+				firstID = txs[0].GetId()
+			}
+
+			return true
+		}, 3*time.Minute, 100*time.Millisecond).Should(BeTrue(), "read never reached an aligned snapshot")
+		Expect(queryErr).To(Succeed())
+		if resultLen > 0 {
+			Fail(fmt.Sprintf("not(ts[_,_]) returned %d row(s), first id=%d — a committed tx surfaced as missing from the READY timestamp index", resultLen, firstID))
+		}
 	})
 })
