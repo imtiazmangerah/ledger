@@ -107,7 +107,7 @@ which:
 
 - **`min_log_sequence` catch-up.** `waitMinLogSequence` charges the
   `WaitForSequence` wait regardless of consistency level, and it runs before
-  routing — so `--consistency leader --min-log-sequence N` yields a non-zero
+  routing — so `--consistency stale --min-log-sequence N` yields a non-zero
   barrier on a perfectly healthy cluster, with no failed attempt anywhere.
 - **A failed `ReadIndex` attempt.** The syncing-follower fallback in
   `RoutedController.readCtrl` records the attempt and may then forward after it
@@ -245,9 +245,9 @@ locally-served one.
 
 ## Known gaps
 
-- **Leader-forwarded reads report only the local hop.** When a follower forwards
-  a read (`ConsistencyLeader`, or the syncing-node fallback in
-  `RoutedController.readCtrl`), the upstream RPC is charged to the local
+- **Leader-forwarded reads report only the local hop.** When a syncing follower
+  falls back to the leader in `RoutedController.readCtrl`, the upstream RPC is
+  charged to the local
   `execute` phase, so `execute` there conflates network hops, leader-side
   prepare, leader-side barrier and leader-side execution. `barrier_duration_us`
   covers only what this node attempted locally.

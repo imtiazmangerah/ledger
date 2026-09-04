@@ -574,15 +574,6 @@ indexes need their own progress barrier:
 - `x-consistency: stale` bypasses `ReadIndex` and reads the local store directly;
   it may return an older view, but any projection it uses is still aligned to
   the fixed applied index of that local main-store snapshot.
-- `x-consistency: leader` routes the read to the node currently considered
-  leader. A call forwarded to a remote node does not propagate the consistency
-  metadata, so the remote call defaults to linearizable mode and performs its
-  quorum barrier. However, if the receiving node already considers itself
-  leader, `getLeaderCtrl` returns the local controller directly and skips
-  `ReadIndex`. Because `CheckQuorum` is disabled, an isolated former leader can
-  therefore serve stale local state in this mode. Projection-backed reads still
-  align to that local main-store snapshot even though no quorum horizon `R` is
-  available.
 - If a non-leader node is syncing or cannot complete its local barrier,
   `RoutedController` can transparently retry the read against the leader. The
   forwarded attempt can still fail when the leader is unavailable. If
