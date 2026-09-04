@@ -93,6 +93,15 @@ func TestAuditFilterNeedsIndex(t *testing.T) {
 			outcome,
 		}}},
 	}
+	mixedOr := &commonpb.QueryFilter{
+		Filter: &commonpb.QueryFilter_Or{Or: &commonpb.OrFilter{Filters: []*commonpb.QueryFilter{
+			seqLower,
+			outcome,
+		}}},
+	}
+	indexedNot := &commonpb.QueryFilter{
+		Filter: &commonpb.QueryFilter_Not{Not: &commonpb.NotFilter{Filter: outcome}},
+	}
 
 	tooDeep := seqLower
 	for range MaxFilterDepth {
@@ -111,6 +120,8 @@ func TestAuditFilterNeedsIndex(t *testing.T) {
 		{name: "and of sequence bounds", input: seqAnd, want: false},
 		{name: "indexed field", input: outcome, want: true},
 		{name: "sequence and indexed field", input: mixedAnd, want: true},
+		{name: "sequence or indexed field", input: mixedOr, want: true},
+		{name: "not indexed field", input: indexedNot, want: true},
 		{name: "malformed sequence condition", input: auditString(commonpb.AuditField_AUDIT_FIELD_SEQUENCE, "bad"), want: true},
 		{name: "missing filter arm", input: &commonpb.QueryFilter{}, want: true},
 		{name: "over depth", input: tooDeep, want: true},

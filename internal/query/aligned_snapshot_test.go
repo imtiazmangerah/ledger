@@ -30,13 +30,15 @@ func setReadStoreProgress(t *testing.T, rs *readstore.Store, seq uint64) {
 
 	batch := rs.NewBatch()
 	require.NoError(t, rs.WriteProgress(batch, seq))
+	require.NoError(t, rs.WriteRaftProgress(batch, seq))
 	require.NoError(t, batch.Commit())
 	rs.NotifyProgress()
 }
 
-// The alignment invariant: the returned snapshot's fold cursor covers the
-// main handle's last applied sequence, so index leaves can never lag the
-// main-store leaves of the same query (EN-1748).
+// The alignment invariant: the returned snapshot's Raft certificate covers
+// the main handle's applied index, so index leaves can never lag the
+// main-store leaves of the same query (EN-1748). The native sequence remains
+// distinct and continues to drive fold resumption and history trimming.
 func TestAlignedIndexSnapshot(t *testing.T) {
 	t.Parallel()
 
@@ -53,9 +55,12 @@ func TestAlignedIndexSnapshot(t *testing.T) {
 	lastSeq, err := query.ReadLastSequence(handle)
 	require.NoError(t, err)
 	require.Positive(t, lastSeq)
+	lastAppliedIndex, err := query.ReadLastAppliedIndex(handle)
+	require.NoError(t, err)
+	require.Positive(t, lastAppliedIndex)
 
 	t.Run("behind then catches up", func(t *testing.T) {
-		setReadStoreProgress(t, rs, lastSeq-1)
+		setReadStoreProgress(t, rs, lastAppliedIndex-1)
 
 		done := make(chan struct{})
 		go func() {
@@ -65,7 +70,7 @@ func TestAlignedIndexSnapshot(t *testing.T) {
 			// it the wait-and-retake loop — both legal executions of the
 			// invariant. The never-catches-up case is pinned by the
 			// context-bound test below.
-			setReadStoreProgress(t, rs, lastSeq)
+			setReadStoreProgress(t, rs, lastAppliedIndex)
 		}()
 
 		snap, mainSeq, release, err := query.AlignedIndexSnapshot(t.Context(), rs, handle, func() {})
@@ -76,14 +81,14 @@ func TestAlignedIndexSnapshot(t *testing.T) {
 
 		require.Equal(t, lastSeq, mainSeq)
 
-		// The vouched cursor is readable through the snapshot itself.
-		got, err := rs.LastIndexedSequenceFrom(snap)
+		// The vouched certificate is readable through the snapshot itself.
+		got, err := rs.ReadRaftProgressFrom(snap)
 		require.NoError(t, err)
-		require.GreaterOrEqual(t, got, mainSeq)
+		require.GreaterOrEqual(t, got, lastAppliedIndex)
 	})
 
 	t.Run("already aligned", func(t *testing.T) {
-		setReadStoreProgress(t, rs, lastSeq+4)
+		setReadStoreProgress(t, rs, lastAppliedIndex+4)
 
 		snap, mainSeq, release, err := query.AlignedIndexSnapshot(t.Context(), rs, handle, func() {})
 		require.NoError(t, err)
@@ -120,6 +125,28 @@ func TestAlignedIndexSnapshot_WaitsOnlyAsLongAsTheCallerAllows(t *testing.T) {
 
 	require.ErrorIs(t, err, context.DeadlineExceeded, "the caller's deadline is what ends the wait")
 	require.Less(t, time.Since(start), time.Second, "it must not outlive the caller's deadline")
+}
+
+func TestAlignedIndexSnapshotRejectsMainSnapshotBehindReadBarrier(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t)
+	registerLedger(t, store, "l")
+	appendLogs(t, store, 3, createTestLogsForLedger("l", 1)...)
+
+	rs := newTestReadStore(t)
+	handle, err := store.NewReadHandle()
+	require.NoError(t, err)
+	defer func() { _ = handle.Close() }()
+
+	horizon, err := query.ReadLastAppliedIndex(handle)
+	require.NoError(t, err)
+	setReadStoreProgress(t, rs, horizon+1)
+
+	ctx := query.WithReadBarrierHorizon(t.Context(), horizon+1)
+	_, _, _, err = query.AlignedIndexSnapshot(ctx, rs, handle, func() {})
+	require.ErrorContains(t, err, "behind ReadIndex horizon",
+		"a projection certificate must not hide a main snapshot older than R")
 }
 
 // A committed transaction whose index rows have not folded yet must be

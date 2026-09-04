@@ -10,6 +10,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/cockroachdb/pebble/v2"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
@@ -56,6 +57,17 @@ const (
 type releasingCloser struct {
 	handle  io.Closer
 	release func()
+}
+
+type joinedCloser []io.Closer
+
+func (c joinedCloser) Close() error {
+	var err error
+	for _, closer := range c {
+		err = errors.Join(err, closer.Close())
+	}
+
+	return err
 }
 
 func (c releasingCloser) Close() error {
@@ -1761,23 +1773,91 @@ func (ctrl *DefaultController) ListAuditEntriesFrom(ctx context.Context, store *
 	// must not be able to force an unbounded materialization.
 	pageSize = ClampFetchSize(pageSize)
 
-	seqs, loSeq, hiSeq, narrowed, err := query.CompileAuditFilter(rs, filter)
-	if err != nil {
-		return nil, err
-	}
-
 	handle, err := store.NewReadHandle()
 	if err != nil {
 		return nil, fmt.Errorf("creating read handle: %w", err)
+	}
+	closeHandle := true
+	defer func() {
+		if closeHandle {
+			_ = handle.Close()
+		}
+	}()
+
+	mainAppliedIndex, err := query.ReadLastAppliedIndex(handle)
+	if err != nil {
+		return nil, fmt.Errorf("reading main-store applied index: %w", err)
+	}
+	if barrier, ok := query.ReadBarrierHorizon(ctx); ok && mainAppliedIndex < barrier {
+		return nil, fmt.Errorf("main-store snapshot applied index %d is behind ReadIndex horizon %d", mainAppliedIndex, barrier)
+	}
+	mainAuditSequence, err := query.ReadLastAuditSequence(handle)
+	if err != nil {
+		return nil, fmt.Errorf("reading main-store audit horizon: %w", err)
+	}
+
+	var auditSnap *pebble.Snapshot
+	indexReader := query.AuditIndexReader(rs)
+	if query.AuditFilterNeedsIndex(filter) {
+		disabled, rebuilding := rs.AuditProjectionState()
+		if disabled || rebuilding {
+			state := "disabled"
+			if rebuilding {
+				state = "rebuilding"
+			}
+
+			return nil, &domain.BusinessError{Err: &domain.ErrIndexBuilding{Index: "audit (" + state + ")"}}
+		}
+
+		for {
+			auditSnap = rs.NewSnapshot()
+			progress, err := rs.ReadAuditRaftProgressFrom(auditSnap)
+			if err != nil {
+				_ = auditSnap.Close()
+
+				return nil, fmt.Errorf("reading audit projection progress: %w", err)
+			}
+			if progress >= mainAppliedIndex {
+				indexReader = readstore.NewAuditIndexSnapshot(auditSnap)
+
+				break
+			}
+			_ = auditSnap.Close()
+			if rs.Frozen() {
+				return nil, &domain.BusinessError{Err: &domain.ErrIndexBuilding{Index: "audit checkpoint"}}
+			}
+			if err := rs.WaitForAuditRaftProgress(ctx, mainAppliedIndex); err != nil {
+				return nil, fmt.Errorf("waiting for audit projection alignment at Raft index %d: %w", mainAppliedIndex, err)
+			}
+		}
+	}
+
+	seqs, loSeq, hiSeq, narrowed, err := query.CompileAuditFilter(indexReader, filter)
+	if err != nil {
+		if auditSnap != nil {
+			_ = auditSnap.Close()
+		}
+
+		return nil, err
+	}
+	if hiSeq > mainAuditSequence {
+		hiSeq = mainAuditSequence
 	}
 
 	// Audit default is chronological (ascending); ReadAuditEntriesPage takes
 	// reverse=false as ascending, so pass reverse through directly.
 	c, err := query.ReadAuditEntriesPage(ctx, handle, seqs, narrowed, loSeq, hiSeq, afterSequence, reverse, pageSize)
 	if err != nil {
-		_ = handle.Close()
+		if auditSnap != nil {
+			_ = auditSnap.Close()
+		}
 
 		return nil, fmt.Errorf("listing audit entries: %w", err)
+	}
+
+	closeHandle = false
+	if auditSnap != nil {
+		return cursor.NewClosingCursor(c, joinedCloser{auditSnap, handle}), nil
 	}
 
 	return cursor.NewClosingCursor(c, handle), nil

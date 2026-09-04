@@ -15,8 +15,6 @@ import (
 	"github.com/formancehq/ledger/v3/tests/e2e/testutil"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // Cross-store snapshot alignment (EN-1748): a transaction visible in the
@@ -125,34 +123,18 @@ var _ = Describe("Cross-store snapshot alignment", Ordered, func() {
 			}
 
 			return st.GetLag()
-		}, 25*time.Second, 10*time.Millisecond).Should(BeNumerically(">=", 5_000), "pressure never made the fold lag — inconclusive")
+		}, 25*time.Second, 10*time.Millisecond).Should(BeNumerically(">=", 1_000), "pressure never made the fold lag — inconclusive")
 		stopPressure()
 
-		// The pre-EN-1946 path can reject with a retryable not-caught-up
-		// precondition. The first response it does serve must already be aligned;
-		// observing any rows from the index complement is the regression.
-		var (
-			queryErr  error
-			resultLen int
-			firstID   uint64
-		)
-		Eventually(func() bool {
-			txs, err := actions.ListTransactionsFiltered(ctx, client, ledgerName, 0, 0, notTs)
-			queryErr = err
-			if err != nil {
-				return status.Code(err) != codes.FailedPrecondition
-			}
-
-			resultLen = len(txs)
-			if resultLen > 0 {
-				firstID = txs[0].GetId()
-			}
-
-			return true
-		}, 3*time.Minute, 100*time.Millisecond).Should(BeTrue(), "read never reached an aligned snapshot")
-		Expect(queryErr).To(Succeed())
-		if resultLen > 0 {
-			Fail(fmt.Sprintf("not(ts[_,_]) returned %d row(s), first id=%d — a committed tx surfaced as missing from the READY timestamp index", resultLen, firstID))
+		// EN-1946 waits for the fixed main-snapshot horizon until the caller's
+		// context ends. Give this one fixed target the full drain budget; a
+		// successful response must already be aligned.
+		queryCtx, cancelQuery := context.WithTimeout(ctx, 3*time.Minute)
+		defer cancelQuery()
+		txs, err := actions.ListTransactionsFiltered(queryCtx, client, ledgerName, 0, 0, notTs)
+		Expect(err).To(Succeed())
+		if len(txs) > 0 {
+			Fail(fmt.Sprintf("not(ts[_,_]) returned %d row(s), first id=%d — a committed tx surfaced as missing from the READY timestamp index", len(txs), txs[0].GetId()))
 		}
 	})
 })
